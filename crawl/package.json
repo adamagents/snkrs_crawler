@@ -1,0 +1,8 @@
+{
+  "name": "snkrs-crawler",
+  "private": true,
+  "scripts": {
+    "crawl": "node crawl.py",
+    "test": "node --test crawler.test.cjs"
+  }
+}
