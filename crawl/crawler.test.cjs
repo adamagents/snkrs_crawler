@@ -2,6 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
+  ProxyPool,
   buildFailurePayload,
   formatPacificDate,
   normalizeLaunchItems,
@@ -133,4 +134,26 @@ test("buildFailurePayload includes explicit failure details and a follow-up task
   assert.deepEqual(payload.log_paths, ["/repo/crawl/logs/failure.log.json"]);
   assert.deepEqual(payload.follow_up_task.repos, ["/repo/crawl"]);
   assert.match(payload.follow_up_task.prompt, /\/repo\/crawl\/logs\/failure\.log\.json/);
+});
+
+test("ProxyPool rotates proxies and applies cooldowns after failure", () => {
+  const pool = new ProxyPool(
+    [
+      { protocol: "http", host: "proxy-1", port: 8001 },
+      { protocol: "http", host: "proxy-2", port: 8002 },
+    ],
+    { cooldownMs: 1000 },
+  );
+
+  const first = pool.getNextProxy(0);
+  const second = pool.getNextProxy(0);
+  assert.equal(`${first.host}:${first.port}`, "proxy-1:8001");
+  assert.equal(`${second.host}:${second.port}`, "proxy-2:8002");
+
+  pool.recordFailure(first, 0);
+  const afterFailure = pool.getNextProxy(200);
+  assert.equal(`${afterFailure.host}:${afterFailure.port}`, "proxy-2:8002");
+
+  const afterCooldown = pool.getNextProxy(1200);
+  assert.equal(`${afterCooldown.host}:${afterCooldown.port}`, "proxy-1:8001");
 });
