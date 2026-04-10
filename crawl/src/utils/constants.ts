@@ -1,16 +1,21 @@
-const DEFAULT_FEED_URL = "https://www.nike.com/launch";
-const PACIFIC_TIME_ZONE = "America/Los_Angeles";
-const REQUEST_TIMEOUT_MS = 30000;
+import type { ProxyDefinition } from "../types";
 
-const DEFAULT_USER_AGENTS = [
+export const DEFAULT_FEED_URL = "https://www.nike.com/launch";
+export const PACIFIC_TIME_ZONE = "America/Los_Angeles";
+export const REQUEST_TIMEOUT_MS = 30_000;
+export const PROXY_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
+export const MAX_PROXY_ATTEMPTS_PER_REQUEST = 8;
+export const CALLBACK_TIMEOUT_MS = 15_000;
+
+export const DEFAULT_USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
-];
+] as const;
 
 // Source: https://iproyal.com/free-proxy-list/ (United States entries, fetched on 2026-04-09)
 // Note: free lists are volatile; stale or dead proxies are expected and handled by runtime fallback.
-const US_FREE_RESIDENTIAL_HTTP_PROXIES = [
+export const US_FREE_RESIDENTIAL_HTTP_PROXIES: ProxyDefinition[] = [
   { host: "198.199.86.11", port: 3128, protocol: "http", country: "United States", city: "North Bergen" },
   { host: "209.97.150.167", port: 8080, protocol: "http", country: "United States", city: "Clifton" },
   { host: "68.185.57.66", port: 80, protocol: "http", country: "United States", city: "Yakima" },
@@ -62,11 +67,3 @@ const US_FREE_RESIDENTIAL_HTTP_PROXIES = [
   { host: "162.159.241.165", port: 80, protocol: "http", country: "United States", city: "Newark" },
   { host: "162.159.242.32", port: 80, protocol: "http", country: "United States", city: "Newark" },
 ];
-
-module.exports = {
-  DEFAULT_FEED_URL,
-  DEFAULT_USER_AGENTS,
-  PACIFIC_TIME_ZONE,
-  REQUEST_TIMEOUT_MS,
-  US_FREE_RESIDENTIAL_HTTP_PROXIES,
-};
