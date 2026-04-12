@@ -4,5 +4,8 @@
   "scripts": {
     "crawl": "node crawl.py",
     "test": "node --test crawler.test.cjs"
+  },
+  "dependencies": {
+    "puppeteer-core": "^23.6.0"
   }
 }

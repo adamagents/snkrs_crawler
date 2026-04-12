@@ -18,6 +18,319 @@ const streamPipeline = promisify(pipeline);
 
 const PROXY_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
 const MAX_PROXY_ATTEMPTS_PER_REQUEST = 8;
+const DEFAULT_CHROME_PROFILE_ROOT = path.join(os.tmpdir(), "snkrs-chrome-profiles");
+const DEFAULT_REPO_REMOTE = "git@github.com:Molten-Bot/moltenhub-code.git";
+const FOLLOW_UP_PROMPT_BASE =
+  "Review the failing log paths first, identify every root cause behind the failed task, fix the underlying issues in this repository, validate locally where possible, and summarize the verified results.";
+
+function parseListEnv(value) {
+  if (!value) {
+    return [];
+  }
+
+  if (Array.isArray(value)) {
+    return value;
+  }
+
+  return String(value)
+    .split(/\r?\n|,/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function toBoolean(value, defaultValue = false) {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+
+  if (["1", "true", "yes", "y", "on"].includes(normalized)) {
+    return true;
+  }
+
+  if (["0", "false", "no", "n", "off"].includes(normalized)) {
+    return false;
+  }
+
+  return defaultValue;
+}
+
+function sanitizeProfileName(name, fallbackIndex = 0) {
+  if (!name) {
+    return `profile-${fallbackIndex + 1}`;
+  }
+
+  const cleaned = String(name)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-_]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  if (cleaned.length === 0) {
+    return `profile-${fallbackIndex + 1}`;
+  }
+
+  return cleaned;
+}
+
+function normalizeProfileDescriptor(value, { rootDir = DEFAULT_CHROME_PROFILE_ROOT, index = 0 } = {}) {
+  if (value && path.isAbsolute(value)) {
+    return {
+      name: sanitizeProfileName(path.basename(value), index),
+      path: value,
+    };
+  }
+
+  const name = sanitizeProfileName(value, index);
+  return {
+    name,
+    path: path.join(rootDir, name),
+  };
+}
+
+function buildChromeProfiles({ requestedProfiles = [], concurrency = 1, rootDir = DEFAULT_CHROME_PROFILE_ROOT } = {}) {
+  const deduped = new Map();
+  const values = Array.isArray(requestedProfiles) ? requestedProfiles : parseListEnv(requestedProfiles);
+
+  values.forEach((entry, index) => {
+    if (entry && typeof entry === "object" && entry.path) {
+      const descriptor = {
+        name: entry.name ?? sanitizeProfileName(path.basename(entry.path), index),
+        path: entry.path,
+      };
+      deduped.set(descriptor.path, descriptor);
+      return;
+    }
+
+    const descriptor = normalizeProfileDescriptor(entry, { rootDir, index });
+    deduped.set(descriptor.path, descriptor);
+  });
+
+  const targetCount = Math.max(1, Number(concurrency) || 1, deduped.size);
+  let autoIndex = deduped.size;
+
+  while (deduped.size < targetCount) {
+    const descriptor = normalizeProfileDescriptor(`auto-profile-${autoIndex + 1}`, { rootDir, index: autoIndex });
+    if (!deduped.has(descriptor.path)) {
+      deduped.set(descriptor.path, descriptor);
+    }
+    autoIndex += 1;
+  }
+
+  const profiles = Array.from(deduped.values());
+  profiles.forEach((descriptor) => ensureDirectory(descriptor.path));
+  return profiles;
+}
+
+function createAbortError(message = "The task was aborted.") {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+}
+
+function raceToFirstSuccess(items, worker, { concurrency } = {}) {
+  if (!Array.isArray(items) || items.length === 0) {
+    throw new Error("At least one task is required to race.");
+  }
+
+  const limit = Math.max(1, Math.min(concurrency || items.length, items.length));
+
+  return new Promise((resolve, reject) => {
+    const controllers = new Map();
+    const errors = [];
+    let resolved = false;
+    let nextIndex = 0;
+    let active = 0;
+
+    const maybeReject = () => {
+      if (!resolved && active === 0 && nextIndex >= items.length) {
+        resolved = true;
+        reject(
+          new AggregateError(
+            errors.map((entry) => entry.error),
+            "All concurrent tasks failed.",
+          ),
+        );
+      }
+    };
+
+    const startTask = () => {
+      if (resolved || nextIndex >= items.length) {
+        maybeReject();
+        return;
+      }
+
+      const index = nextIndex;
+      const item = items[index];
+      nextIndex += 1;
+      const controller = new AbortController();
+      controllers.set(index, controller);
+      active += 1;
+
+      Promise.resolve()
+        .then(() => worker(item, { signal: controller.signal }))
+        .then((value) => {
+          if (resolved) {
+            return;
+          }
+          resolved = true;
+          controllers.forEach((ctrl, ctrlIndex) => {
+            if (ctrlIndex !== index) {
+              ctrl.abort();
+            }
+          });
+          resolve({ item, index, value });
+        })
+        .catch((error) => {
+          controllers.delete(index);
+          errors.push({ item, error });
+        })
+        .finally(() => {
+          controllers.delete(index);
+          active -= 1;
+          if (!resolved) {
+            if (nextIndex < items.length) {
+              startTask();
+            } else {
+              maybeReject();
+            }
+          }
+        });
+    };
+
+    for (let i = 0; i < limit; i += 1) {
+      startTask();
+    }
+  });
+}
+
+let cachedPuppeteer = null;
+
+function loadPuppeteer() {
+  if (cachedPuppeteer) {
+    return cachedPuppeteer;
+  }
+
+  try {
+    cachedPuppeteer = require("puppeteer-core");
+    return cachedPuppeteer;
+  } catch (error) {
+    if (error.code !== "MODULE_NOT_FOUND") {
+      throw error;
+    }
+  }
+
+  try {
+    cachedPuppeteer = require("puppeteer");
+    return cachedPuppeteer;
+  } catch (error) {
+    if (error.code === "MODULE_NOT_FOUND") {
+      throw new Error(
+        "Browser crawling requires either 'puppeteer-core' or 'puppeteer'. Install one of them or disable browser mode.",
+      );
+    }
+    throw error;
+  }
+}
+
+async function defaultChromeFetcher(
+  url,
+  { profile, headless = true, executablePath, waitUntil = "networkidle2", navigationTimeoutMs = REQUEST_TIMEOUT_MS, signal } = {},
+) {
+  const puppeteer = loadPuppeteer();
+  ensureDirectory(profile.path);
+
+  if (signal?.aborted) {
+    throw createAbortError();
+  }
+
+  let browser;
+  let aborted = false;
+
+  const closeBrowser = async () => {
+    if (!browser) {
+      return;
+    }
+    const instance = browser;
+    browser = null;
+    await instance.close().catch(() => {});
+  };
+
+  const abortHandler = () => {
+    aborted = true;
+    closeBrowser();
+  };
+
+  if (signal) {
+    signal.addEventListener("abort", abortHandler, { once: true });
+  }
+
+  try {
+    browser = await puppeteer.launch({
+      headless,
+      executablePath,
+      userDataDir: profile.path,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+      defaultViewport: null,
+    });
+
+    const page = await browser.newPage();
+    await page.goto(url, { waitUntil, timeout: navigationTimeoutMs });
+    const html = await page.content();
+
+    if (aborted || signal?.aborted) {
+      throw createAbortError();
+    }
+
+    return html;
+  } finally {
+    if (signal) {
+      signal.removeEventListener("abort", abortHandler);
+    }
+
+    await closeBrowser();
+  }
+}
+
+async function fetchHtmlViaChromePool(
+  url,
+  {
+    profiles,
+    concurrency = profiles.length,
+    headless = true,
+    executablePath,
+    waitUntil = "networkidle2",
+    navigationTimeoutMs = REQUEST_TIMEOUT_MS,
+    browserFetcher = defaultChromeFetcher,
+  } = {},
+) {
+  if (!Array.isArray(profiles) || profiles.length === 0) {
+    throw new Error("At least one Chrome profile must be configured for browser crawling.");
+  }
+
+  const normalizedConcurrency = Math.max(1, Math.min(concurrency || profiles.length, profiles.length));
+  const { item: profile, value: html } = await raceToFirstSuccess(
+    profiles,
+    (profileDescriptor, { signal }) =>
+      browserFetcher(url, {
+        profile: profileDescriptor,
+        headless,
+        executablePath,
+        waitUntil,
+        navigationTimeoutMs,
+        signal,
+      }),
+    { concurrency: normalizedConcurrency },
+  );
+
+  return { html, profile };
+}
 
 function pickUserAgent(userAgents = DEFAULT_USER_AGENTS, seed = Date.now()) {
   if (!Array.isArray(userAgents) || userAgents.length === 0) {
@@ -371,18 +684,18 @@ function writeFailureLog(errorPayload, logDirectory = path.join(process.cwd(), "
   return filePath;
 }
 
-function buildFollowUpTask(repoPath, logPaths) {
+function buildFollowUpTask(repoPath = DEFAULT_REPO_REMOTE, logPaths = []) {
   const logSummary = logPaths.length > 0 ? ` Failing log paths: ${logPaths.join(", ")}.` : "";
 
   return {
-    repos: [repoPath],
+    repos: [repoPath || DEFAULT_REPO_REMOTE],
     baseBranch: "main",
     targetSubdir: ".",
-    prompt: `Review the failing log paths first, identify every root cause behind the failed task, fix the underlying issues in this repository, validate locally where possible, and summarize the verified results.${logSummary}`,
+    prompt: `${FOLLOW_UP_PROMPT_BASE}${logSummary}`,
   };
 }
 
-function buildFailurePayload(error, { repoPath = process.cwd(), logPaths = [], phase = "crawl" } = {}) {
+function buildFailurePayload(error, { repoPath = process.cwd(), repoRemote = DEFAULT_REPO_REMOTE, logPaths = [], phase = "crawl" } = {}) {
   return {
     status: "failure",
     phase,
@@ -392,8 +705,12 @@ function buildFailurePayload(error, { repoPath = process.cwd(), logPaths = [], p
       message: error?.message ?? "Unknown error",
       stack: error?.stack ?? null,
     },
+    repository: {
+      path: repoPath,
+      remote: repoRemote,
+    },
     log_paths: logPaths,
-    follow_up_task: buildFollowUpTask(repoPath, logPaths),
+    follow_up_task: buildFollowUpTask(repoRemote, logPaths),
   };
 }
 
@@ -421,13 +738,91 @@ async function writeStdoutJson(payload, targetPath) {
 async function crawlSnkrs({
   feedUrl = process.env.SNKRS_FEED_URL || DEFAULT_FEED_URL,
   outputPath = process.env.SNKRS_OUTPUT_PATH,
-  userAgents = process.env.SNKRS_USER_AGENTS ? process.env.SNKRS_USER_AGENTS.split(/\r?\n|,/).map((value) => value.trim()).filter(Boolean) : DEFAULT_USER_AGENTS,
+  userAgents = process.env.SNKRS_USER_AGENTS ? parseListEnv(process.env.SNKRS_USER_AGENTS) : DEFAULT_USER_AGENTS,
   seed = process.env.SNKRS_USER_AGENT_SEED || Date.now(),
+  requestMode = (process.env.SNKRS_REQUEST_MODE || process.env.SNKRS_BROWSER_MODE || "http").toLowerCase(),
+  chromeProfiles = process.env.SNKRS_CHROME_PROFILES,
+  chromeProfileRoot = process.env.SNKRS_CHROME_PROFILE_ROOT || DEFAULT_CHROME_PROFILE_ROOT,
+  browserConcurrency = process.env.SNKRS_BROWSER_CONCURRENCY,
+  browserHeadless = toBoolean(process.env.SNKRS_BROWSER_HEADLESS ?? "true", true),
+  chromeExecutablePath = process.env.SNKRS_CHROME_EXECUTABLE_PATH,
+  browserWaitUntil = process.env.SNKRS_BROWSER_WAIT_UNTIL || "networkidle2",
+  browserNavigationTimeoutMs = Number(process.env.SNKRS_BROWSER_TIMEOUT_MS) || REQUEST_TIMEOUT_MS,
+  browserFallbackToHttp = toBoolean(process.env.SNKRS_BROWSER_FALLBACK_TO_HTTP ?? "true", true),
+  browserFetcher,
 } = {}) {
-  const userAgent = pickUserAgent(userAgents, seed);
-  const html = await fetchText(feedUrl, { userAgent });
+  const normalizedUserAgents = Array.isArray(userAgents) ? userAgents : parseListEnv(userAgents);
+  const agentPool = normalizedUserAgents.length > 0 ? normalizedUserAgents : DEFAULT_USER_AGENTS;
+  const userAgent = pickUserAgent(agentPool, seed);
+
+  const requestedConcurrency = Number(browserConcurrency);
+  const hasExplicitConcurrency = Number.isFinite(requestedConcurrency) && requestedConcurrency > 0;
+  const profileInput = chromeProfiles;
+  const shouldPreferBrowser = ["browser", "chrome", "puppeteer"].includes(requestMode);
+  const profileCountHint = Array.isArray(profileInput) ? profileInput.length : parseListEnv(profileInput).length;
+  const hasProfileConfig = profileCountHint > 0;
+  const useBrowser = shouldPreferBrowser || hasProfileConfig || hasExplicitConcurrency;
+
+  let html;
+  let htmlSource = { mode: "http", concurrency: 1 };
+
+  if (useBrowser) {
+    const profiles = buildChromeProfiles({
+      requestedProfiles: profileInput,
+      concurrency: hasExplicitConcurrency ? requestedConcurrency : undefined,
+      rootDir: chromeProfileRoot,
+    });
+    const effectiveConcurrency = Math.max(1, hasExplicitConcurrency ? requestedConcurrency : profiles.length);
+
+    try {
+      const { html: browserHtml, profile } = await fetchHtmlViaChromePool(feedUrl, {
+        profiles,
+        concurrency: effectiveConcurrency,
+        headless: browserHeadless,
+        executablePath: chromeExecutablePath,
+        waitUntil: browserWaitUntil,
+        navigationTimeoutMs: browserNavigationTimeoutMs,
+        browserFetcher,
+      });
+      html = browserHtml;
+      htmlSource = {
+        mode: "browser",
+        profile,
+        concurrency: effectiveConcurrency,
+      };
+    } catch (browserError) {
+      if (!browserFallbackToHttp) {
+        throw browserError;
+      }
+
+      html = await fetchText(feedUrl, { userAgent });
+      htmlSource = {
+        mode: "http",
+        concurrency: 1,
+        fallback: "http",
+        browser_error: browserError.message,
+      };
+    }
+  } else {
+    html = await fetchText(feedUrl, { userAgent });
+  }
+
   const state = parseInitialState(html);
   const items = normalizeLaunchItems(state);
+
+  const warnings = [
+    "This implementation uses the public Nike launch page only.",
+  ];
+
+  if (htmlSource.mode === "http") {
+    warnings.push("Free proxies are volatile; the crawler rotates through a US pool and falls back to direct requests when needed.");
+  } else {
+    warnings.push("Browser crawling depends on local Chrome profiles; keep them isolated per worker to avoid state collisions.");
+  }
+
+  if (htmlSource.browser_error) {
+    warnings.push(`Browser mode failed (${htmlSource.browser_error}); HTTP fallback succeeded.`);
+  }
 
   const payload = {
     status: "success",
@@ -435,10 +830,14 @@ async function crawlSnkrs({
     requested_at_utc: new Date().toISOString(),
     item_count: items.length,
     items,
-    warnings: [
-      "This implementation uses the public Nike launch page only.",
-      "Free proxies are volatile; the crawler rotates through a US pool and falls back to direct requests when needed.",
-    ],
+    warnings,
+    context: {
+      request_mode: htmlSource.mode,
+      browser_profile: htmlSource.profile?.name ?? null,
+      browser_profile_path: htmlSource.profile?.path ?? null,
+      browser_concurrency: htmlSource.concurrency ?? null,
+      fallback_mode: htmlSource.fallback ?? null,
+    },
   };
 
   await writeStdoutJson(payload, outputPath);
@@ -449,10 +848,12 @@ async function runCli() {
   try {
     await crawlSnkrs();
   } catch (error) {
-    const preliminaryPayload = buildFailurePayload(error, { repoPath: process.cwd() });
+    const repoRemote = process.env.MOLTENBOT_REPO_REMOTE || DEFAULT_REPO_REMOTE;
+    const repoDetails = { repoPath: process.cwd(), repoRemote };
+    const preliminaryPayload = buildFailurePayload(error, repoDetails);
     const logPath = writeFailureLog(preliminaryPayload);
     const failurePayload = buildFailurePayload(error, {
-      repoPath: process.cwd(),
+      ...repoDetails,
       logPaths: [logPath],
     });
 
@@ -473,15 +874,18 @@ async function runCli() {
 module.exports = {
   DEFAULT_FEED_URL,
   DEFAULT_USER_AGENTS,
+  buildChromeProfiles,
   buildFailurePayload,
   buildFollowUpTask,
   crawlSnkrs,
   extractNextDataJson,
+  fetchHtmlViaChromePool,
   formatPacificDate,
   normalizeLaunchItems,
   parseInitialState,
   pickUserAgent,
   ProxyPool,
+  raceToFirstSuccess,
   requestDirect,
   requestViaProxy,
   runCli,
