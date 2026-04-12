@@ -1,9 +1,15 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { setTimeout: delay } = require("node:timers/promises");
 
 const {
+  buildChromeProfiles,
   ProxyPool,
   buildFailurePayload,
+  raceToFirstSuccess,
   formatPacificDate,
   normalizeLaunchItems,
   parseInitialState,
@@ -124,6 +130,7 @@ test("normalizeLaunchItems returns only launch products with the requested field
 test("buildFailurePayload includes explicit failure details and a follow-up task", () => {
   const payload = buildFailurePayload(new Error("Boom"), {
     repoPath: "/repo/crawl",
+    repoRemote: "git@github.com:Molten-Bot/moltenhub-code.git",
     logPaths: ["/repo/crawl/logs/failure.log.json"],
     phase: "parse",
   });
@@ -131,8 +138,12 @@ test("buildFailurePayload includes explicit failure details and a follow-up task
   assert.equal(payload.status, "failure");
   assert.equal(payload.phase, "parse");
   assert.equal(payload.error.message, "Boom");
+  assert.deepEqual(payload.repository, {
+    path: "/repo/crawl",
+    remote: "git@github.com:Molten-Bot/moltenhub-code.git",
+  });
   assert.deepEqual(payload.log_paths, ["/repo/crawl/logs/failure.log.json"]);
-  assert.deepEqual(payload.follow_up_task.repos, ["/repo/crawl"]);
+  assert.deepEqual(payload.follow_up_task.repos, ["git@github.com:Molten-Bot/moltenhub-code.git"]);
   assert.match(payload.follow_up_task.prompt, /\/repo\/crawl\/logs\/failure\.log\.json/);
 });
 
@@ -156,4 +167,60 @@ test("ProxyPool rotates proxies and applies cooldowns after failure", () => {
 
   const afterCooldown = pool.getNextProxy(1200);
   assert.equal(`${afterCooldown.host}:${afterCooldown.port}`, "proxy-1:8001");
+});
+
+test("buildChromeProfiles ensures unique directories and auto-fills concurrency gaps", () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "snkrs-chrome-profiles-test-"));
+  try {
+    const absoluteProfile = path.join(tempRoot, "abs-profile");
+    const profiles = buildChromeProfiles({
+      requestedProfiles: ["custom-one", { path: absoluteProfile, name: "absolute-custom" }],
+      concurrency: 3,
+      rootDir: tempRoot,
+    });
+
+    assert.equal(profiles.length, 3);
+    assert(profiles.some((profile) => profile.name === "custom-one" && profile.path === path.join(tempRoot, "custom-one")));
+    assert(profiles.some((profile) => profile.path === absoluteProfile));
+    profiles.forEach((profile) => {
+      assert.ok(fs.existsSync(profile.path));
+    });
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("raceToFirstSuccess resolves with the first successful task and aborts the rest", async () => {
+  const aborted = new Set();
+  const result = await raceToFirstSuccess(
+    ["slow", "winner", "fail"],
+    async (id, { signal }) => {
+      signal?.addEventListener("abort", () => aborted.add(id));
+      if (id === "winner") {
+        await delay(5);
+        return "ok";
+      }
+
+      await delay(id === "slow" ? 50 : 10);
+      throw new Error(`fail-${id}`);
+    },
+    { concurrency: 2 },
+  );
+
+  assert.equal(result.item, "winner");
+  assert.equal(result.value, "ok");
+  assert(aborted.has("slow"));
+});
+
+test("raceToFirstSuccess rejects with an AggregateError when every task fails", async () => {
+  await assert.rejects(
+    raceToFirstSuccess(
+      ["one", "two"],
+      async () => {
+        throw new Error("nope");
+      },
+      { concurrency: 2 },
+    ),
+    (error) => error instanceof AggregateError && error.errors.length === 2,
+  );
 });

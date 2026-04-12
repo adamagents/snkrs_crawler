@@ -1,0 +1,222 @@
+openapi: 3.1.0
+info:
+  title: Moltenbot Hub Offline Runner (NA Region)
+  version: 1.0.0
+  description: >
+    Contract for issuing offline crawl jobs to Moltenbot Hub and receiving
+    success/failure callbacks. The crawler in this repository posts failure payloads
+    that conform to `CrawlFailurePayload`.
+servers:
+  - url: https://na.hub.molten.bot
+paths:
+  /offline-tasks:
+    post:
+      summary: Create or update an offline crawl schedule
+      description: |
+        Issue or adjust a scheduled job. When `replaceIfExists` is true, the hub
+        replaces the existing task with the supplied definition.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OfflineTaskRequest'
+      responses:
+        '200':
+          description: Offline task accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OfflineTaskResponse'
+  /callbacks/crawl-results:
+    post:
+      summary: Receive successful crawl payloads
+      description: >
+        The crawler sends this payload when Nike launch data is collected successfully.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CrawlResultPayload'
+      responses:
+        '204':
+          description: Callback acknowledged
+  /callbacks/crawl-failures:
+    post:
+      summary: Receive crawl failure payloads
+      description: |
+        The crawler posts failure details to this endpoint when it cannot complete the task.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CrawlFailurePayload'
+      responses:
+        '204':
+          description: Callback acknowledged
+components:
+  schemas:
+    OfflineTaskRequest:
+      type: object
+      required:
+        - name
+        - schedule
+        - command
+        - environment
+        - failureCallback
+      properties:
+        name:
+          type: string
+          description: Unique identifier for the offline task.
+        schedule:
+          type: string
+          description: Cron expression using UTC.
+          example: '*/30 * * * *'
+        command:
+          type: string
+          description: Shell command Moltenbot should execute (e.g., `npm run crawl`).
+        workingDirectory:
+          type: string
+          description: Absolute path where the command runs.
+        environment:
+          type: object
+          description: Key-value map of environment variables (browser concurrency, callbacks, etc.).
+          additionalProperties:
+            type: string
+        replaceIfExists:
+          type: boolean
+          default: false
+        failureCallback:
+          type: string
+          format: uri
+          description: HTTPS endpoint invoked on failure (e.g., https://na.hub.molten.bot/callbacks/crawl-failures).
+        successCallback:
+          type: string
+          format: uri
+          description: Optional endpoint invoked after successful runs.
+    OfflineTaskResponse:
+      type: object
+      required:
+        - taskId
+        - status
+      properties:
+        taskId:
+          type: string
+        status:
+          type: string
+          enum: [scheduled, replaced]
+        nextRunUtc:
+          type: string
+          format: date-time
+    CrawlResultPayload:
+      type: object
+      required:
+        - status
+        - source
+        - requested_at_utc
+        - item_count
+        - items
+      properties:
+        status:
+          type: string
+          enum: [success]
+        source:
+          type: string
+          format: uri
+        requested_at_utc:
+          type: string
+          format: date-time
+        item_count:
+          type: integer
+        items:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        warnings:
+          type: array
+          items:
+            type: string
+        context:
+          type: object
+          properties:
+            request_mode:
+              type: string
+              enum: [http, browser]
+            browser_profile:
+              type: string
+            browser_profile_path:
+              type: string
+            browser_concurrency:
+              type: integer
+            fallback_mode:
+              type: string
+    CrawlFailurePayload:
+      type: object
+      required:
+        - status
+        - phase
+        - message
+        - error
+        - repository
+        - log_paths
+        - follow_up_task
+      properties:
+        status:
+          type: string
+          enum: [failure]
+        phase:
+          type: string
+          description: Pipeline phase where the failure happened (crawl, parse, normalize, etc.).
+        message:
+          type: string
+        error:
+          type: object
+          required:
+            - name
+            - message
+          properties:
+            name:
+              type: string
+            message:
+              type: string
+            stack:
+              type: string
+        repository:
+          type: object
+          required:
+            - path
+            - remote
+          properties:
+            path:
+              type: string
+              description: Absolute path of the failing checkout.
+            remote:
+              type: string
+              description: Git remote (defaults to git@github.com:Molten-Bot/moltenhub-code.git).
+        log_paths:
+          type: array
+          description: Local log files containing the failure payload(s).
+          items:
+            type: string
+        follow_up_task:
+          type: object
+          description: Run-config payload that should be queued for remediation.
+          required:
+            - repos
+            - baseBranch
+            - targetSubdir
+            - prompt
+          properties:
+            repos:
+              type: array
+              items:
+                type: string
+            baseBranch:
+              type: string
+            targetSubdir:
+              type: string
+            prompt:
+              type: string
