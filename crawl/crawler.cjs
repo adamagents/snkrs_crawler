@@ -749,6 +749,7 @@ async function crawlSnkrs({
   browserWaitUntil = process.env.SNKRS_BROWSER_WAIT_UNTIL || "networkidle2",
   browserNavigationTimeoutMs = Number(process.env.SNKRS_BROWSER_TIMEOUT_MS) || REQUEST_TIMEOUT_MS,
   browserFallbackToHttp = toBoolean(process.env.SNKRS_BROWSER_FALLBACK_TO_HTTP ?? "true", true),
+  chromePoolFetcher = fetchHtmlViaChromePool,
   browserFetcher,
 } = {}) {
   const normalizedUserAgents = Array.isArray(userAgents) ? userAgents : parseListEnv(userAgents);
@@ -775,7 +776,7 @@ async function crawlSnkrs({
     const effectiveConcurrency = Math.max(1, hasExplicitConcurrency ? requestedConcurrency : profiles.length);
 
     try {
-      const { html: browserHtml, profile } = await fetchHtmlViaChromePool(feedUrl, {
+      const { html: browserHtml, profile } = await chromePoolFetcher(feedUrl, {
         profiles,
         concurrency: effectiveConcurrency,
         headless: browserHeadless,

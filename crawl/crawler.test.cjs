@@ -14,6 +14,7 @@ const {
   normalizeLaunchItems,
   parseInitialState,
   pickUserAgent,
+  crawlSnkrs,
 } = require("./crawler.cjs");
 
 function buildHtmlFromState(state) {
@@ -185,6 +186,49 @@ test("buildChromeProfiles ensures unique directories and auto-fills concurrency 
     profiles.forEach((profile) => {
       assert.ok(fs.existsSync(profile.path));
     });
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("crawlSnkrs surfaces browser metadata when Chrome concurrency is configured", async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "snkrs-crawler-browser-test-"));
+  const minimalState = {
+    product: {
+      threads: { data: { ids: [], items: {} } },
+      products: { data: { items: {} } },
+      availabilities: { data: { items: {} } },
+    },
+  };
+  const html = buildHtmlFromState(minimalState);
+  let poolInvocation = null;
+
+  const chromePoolFetcher = async (url, options) => {
+    poolInvocation = options;
+    assert.equal(options.concurrency, 2);
+    assert.equal(options.profiles.length, 2);
+    return { html, profile: options.profiles[1] };
+  };
+
+  try {
+    const outputPath = path.join(tempRoot, "result.json");
+    const payload = await crawlSnkrs({
+      feedUrl: "https://example.com/launch",
+      requestMode: "browser",
+      chromeProfiles: ["west", "central"],
+      chromeProfileRoot: tempRoot,
+      browserConcurrency: 2,
+      browserFallbackToHttp: false,
+      outputPath,
+      chromePoolFetcher,
+    });
+
+    assert(poolInvocation, "Expected chromePoolFetcher to be invoked");
+    assert.equal(payload.context.request_mode, "browser");
+    assert.equal(payload.context.browser_concurrency, 2);
+    assert.equal(payload.context.browser_profile, "central");
+    assert.deepEqual(payload.items, []);
+    assert.equal(fs.existsSync(outputPath), true);
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
