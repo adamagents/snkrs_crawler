@@ -1,5 +1,5 @@
 #!/usr/bin/env node
 
-const { runCli } = require("./crawler.cjs");
+import { runCli } from "./src/crawler";
 
-runCli();
+void runCli();

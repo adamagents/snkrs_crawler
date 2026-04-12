@@ -1,8 +1,19 @@
 {
   "name": "snkrs-crawler",
   "private": true,
+  "type": "module",
   "scripts": {
     "crawl": "node crawl.py",
-    "test": "node --test crawler.test.cjs"
+    "test": "node --import tsx --test src/crawler.test.ts",
+    "test:coverage": "node --import tsx --test --experimental-test-coverage --test-coverage-exclude=src/types.ts src/crawler.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
   }
 }
